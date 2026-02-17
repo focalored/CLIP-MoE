@@ -564,6 +564,9 @@ class CLIP(nn.Module):
             image_features_long = self.encode_image(image)
             text_features_long = self.encode_text(text_long)
             
+        # TODO: Decide which tokens to project for contrastive loss (the 8 expert tokens?)
+        # Currently, image_features_long contains (router_token, expert_tokens)
+        # and will require processing before .norm() can be safely called below.
 
         # normalized features
         image_features_long = image_features_long / image_features_long.norm(dim=1, keepdim=True)
