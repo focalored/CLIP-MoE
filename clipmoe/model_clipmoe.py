@@ -251,17 +251,24 @@ class MoETransformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,MoE_args=0):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, MoE_args=0, num_experts=0):
         super().__init__()
-        self.MoE_args=MoE_args
+        self.MoE_args = MoE_args
+        self.num_experts = num_experts
+        self.num_total_cls = num_experts + 1
+
         self.input_resolution = input_resolution
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        
+        self.cls_tokens = nn.Parameter(scale * torch.randn(self.num_total_cls, width))
+        num_patches = (input_resolution // patch_size) ** 2
+        self.positional_embedding = nn.Parameter(scale * torch.randn(num_patches + self.num_total_cls, width))
+
         self.ln_pre = LayerNorm(width)
+
         if MoE_args:
             self.transformer = MoETransformer(width, layers, heads,MoE_args=MoE_args)
         else:
@@ -278,7 +285,7 @@ class VisionTransformer(nn.Module):
             groups = [
                 [
                     self.conv1,
-                    self.class_embedding,
+                    self.cls_tokens,
                     self.positional_embedding,
                     self.ln_pre,
                 ],
@@ -304,29 +311,36 @@ class VisionTransformer(nn.Module):
             _unlock(groups[-unlocked_groups:])
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+        x = self.conv1(x)  # [B, width, H, W]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, width, num_patches]
+        x = x.permute(0, 2, 1)  # [B, num_patches, width]
+        
+        # Inject tokens + Add new positional embedding
+        cls_tokens = self.cls_tokens.expand(x.shape[0], -1, -1).to(x.dtype)  # [B, 9, width]
+        x = torch.cat([cls_tokens, x], dim=1)  # [B, 9 + num_patches, width]
+        
+        x = x + self.positional_embedding.to(x.dtype)  # [B, 9 + num_patches, width]
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        router_logits=None
-        if self.MoE_args:
-            x,router_logits=self.transformer(x)
+        output = self.transformer(x)
+        if isinstance(output, tuple):
+            x, router_logits = output
         else:
-            x = self.transformer(x)
+            x = output
+            router_logits = None
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        x = self.ln_post(x[:, 0, :])
-
-        if self.proj is not None:
-            x = x @ self.proj
-        if self.MoE_args:
-            return x,router_logits
+        # Extract tokens
+        if self.num_experts > 0:
+            router_token = self.ln_post(x[:, 0:1, :])  # [B, 1, width]
+            expert_tokens = self.ln_post(x[:, 1:self.num_total_cls, :])  # [B, 8, width]
+            return (router_token, expert_tokens, router_logits) if self.MoE_args else (router_token, expert_tokens)
         else:
-            return x
+            x = self.ln_post(x[:, 0, :])
+            if self.proj is not None:
+                x = x @ self.proj
+            return (x, router_logits) if self.MoE_args else x
 
 
 class CLIP(nn.Module):
@@ -345,10 +359,12 @@ class CLIP(nn.Module):
                  transformer_layers: int, 
                  load_from_clip: bool,
                  MoE_args=None,
+                 num_experts=0,
                  use_short_text=False
                  ):
         super().__init__()
-        self.MoE_args=MoE_args
+        self.MoE_args = MoE_args
+        self.num_experts = num_experts
 
         self.context_length = 248
         self.use_short_text=use_short_text
@@ -362,7 +378,8 @@ class CLIP(nn.Module):
             layers=vision_layers,
             heads=vision_heads,
             output_dim=embed_dim,
-            MoE_args=MoE_args
+            MoE_args=MoE_args,
+            num_experts=num_experts
         )
 
         if self.MoE_args:
@@ -492,14 +509,25 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image,router_output=False):
-        if self.MoE_args:
-            x,router_logits=self.visual(image.type(self.dtype))
-        else:
-            return self.visual(image.type(self.dtype))
+    def encode_image(self, image, router_output=False):
+        visual_output = self.visual(image.type(self.dtype))
+        router_logits = None
 
-        if self.training or router_output:
-            return x,router_logits
+        if self.num_experts > 0:
+            if self.MoE_args:
+                router_token, expert_tokens, router_logits = visual_output
+            else:
+                router_token, expert_tokens = visual_output
+
+            x = router_token.squeeze(1)
+        else:
+            if isinstance(visual_output, tuple):
+                x, router_logits = visual_output
+            else:
+                x = visual_output
+
+        if self.MoE_args or router_output:
+            return x, router_logits
         else:
             return x
 
@@ -617,7 +645,42 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None):
+def fix_state_dict_for_multicls(state_dict, num_total_cls):
+    """
+    Expands positional embeddings and renames/reshapes class_embedding 
+    to fit the new cls_tokens parameter.
+    """
+    new_sd = state_dict.copy()
+    
+    # 1. Handle Positional Embedding [257, 1024] -> [265, 1024]
+    if "visual.positional_embedding" in state_dict:
+        v = state_dict["visual.positional_embedding"]
+        old_cls_pe = v[0:1]
+        patches_pe = v[1:]
+        width = v.shape[-1]
+        
+        expanded_pe = torch.zeros((num_total_cls + patches_pe.shape[0], width), dtype=v.dtype)
+        expanded_pe[0:1].copy_(old_cls_pe) # Original CLS PE stays at the front (router)
+        expanded_pe[num_total_cls:].copy_(patches_pe) # Patches move to the back
+        new_sd["visual.positional_embedding"] = expanded_pe
+
+    # 2. Convert class_embedding (vector) to cls_tokens (matrix)
+    if "visual.class_embedding" in state_dict:
+        v = state_dict["visual.class_embedding"] # [width]
+        width = v.shape[-1]
+        # Create [9, width] and place original CLS at index 0
+        new_cls = torch.zeros((num_total_cls, width), dtype=v.dtype)
+        new_cls[0].copy_(v)
+        new_sd["visual.cls_tokens"] = new_cls
+        del new_sd["visual.class_embedding"]
+
+    return new_sd
+
+
+def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None, multi_cls=False):
+    num_experts = 8 if multi_cls else 0
+    num_total_cls = num_experts + 1
+
     #MoE_args: None for standard non-MoE model. [num_MoE_experts,top_k]
     vit = "visual.proj" in state_dict
 
@@ -646,15 +709,18 @@ def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None):
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, load_from_clip,MoE_args
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, load_from_clip, MoE_args, num_experts
     )
+
+    if multi_cls:
+        state_dict = fix_state_dict_for_multicls(state_dict, num_total_cls)
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
     if not MoE_args:
         convert_weights(model)
-        model.load_state_dict(state_dict)
+        model.load_state_dict(state_dict, strict=False)
         return model.eval()
     else:
         #only build the MoE model, do not load state dict
