@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from typing import Tuple, Union
-
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,6 +8,35 @@ from torch import nn
 import torch.distributed.nn
 import torch.distributed as dist
 from typing import Sequence
+
+
+@dataclass
+class CLIPConfig:
+    embed_dim: int = 768 # embedding dimension
+
+    # vision Transformer
+    vision_width: int = 1024 # Transformer hidden dim
+    vision_layers: int = 12 # number of layers
+    vision_heads: int = 12 # number of heads
+    vision_patch_size: int = 14
+    image_resolution: int = 224
+
+    # Transformer
+    text_width: int = 768
+    text_layers: int = 12
+    text_heads: int = 12
+    vocab_size: int = 49408
+    context_length: int = 248
+
+    # Zhang2025 config
+    num_experts: int = 8
+    top_k: int = 1
+    dropout: int = 0.2
+    MoE_layers: int = 12
+    
+    # multi CLS token specifics
+    num_cls: int = 8
+    head_type: str = "linear"
 
 
 
@@ -135,7 +164,7 @@ class MoEResidualAttentionBlock(nn.Module):
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        #selected_experts batch_size * sequence_length, top_k
+        # selected_experts batch_size * sequence_length, top_k
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
@@ -251,7 +280,7 @@ class MoETransformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, MoE_args=0, num_experts=0):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, MoE_args=0, num_experts=0, head_type=""):
         super().__init__()
         self.MoE_args = MoE_args
         self.num_experts = num_experts
@@ -269,13 +298,37 @@ class VisionTransformer(nn.Module):
 
         self.ln_pre = LayerNorm(width)
 
-        if MoE_args:
-            self.transformer = MoETransformer(width, layers, heads,MoE_args=MoE_args)
+        if self.MoE_args:
+            self.transformer = MoETransformer(width, layers, heads, MoE_args=MoE_args)
         else:
             self.transformer = Transformer(width, layers, heads)
+            self.router_head = nn.Linear(width, num_experts, bias=False)
+            torch.nn.init.normal_(self.router_head.weight, std=0.02)
 
         self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.proj = self._get_projection_head(head_type, width, output_dim)
+
+    def _get_projection_head(self, head_type, width, output_dim, init_std=0.02):
+        """Factory function for modular projection heads in ViT"""
+
+        if head_type == "linear" or head_type == "":
+            head = nn.Linear(width, output_dim, bias=False)
+            torch.nn.init.normal_(head.weight, std=init_std)
+            return head
+        elif head_type == "mlp":
+            head = nn.Sequential(
+                nn.Linear(width, width),
+                QuickGELU(),
+                nn.Linear(width, output_dim)
+            )
+            for module in head:
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.normal_(module.weight, std=init_std)
+                    if module.bias is not None:
+                        torch.nn.init.constant_(module.bias, 0)
+            return head
+        else:
+            raise ValueError(f"Unknown head type: {head_type}")
 
     def lock(self, unlocked_groups=0, freeze_bn_stats=False):
         for param in self.parameters():
@@ -324,24 +377,33 @@ class VisionTransformer(nn.Module):
 
         x = x.permute(1, 0, 2)  # NLD -> LND
         output = self.transformer(x)
-        if isinstance(output, tuple):
+        if self.MoE_args:
             x, router_logits = output
         else:
             x = output
-            router_logits = None
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         # Extract tokens
-        if self.num_experts > 0:
-            router_token = self.ln_post(x[:, 0:1, :])  # [B, 1, width]
-            expert_tokens = self.ln_post(x[:, 1:self.num_total_cls, :])  # [B, 8, width]
-            return (router_token, expert_tokens, router_logits) if self.MoE_args else (router_token, expert_tokens)
-        else:
+        if self.MoE_args:
             x = self.ln_post(x[:, 0, :])
-            if self.proj is not None:
-                x = x @ self.proj
-            return (x, router_logits) if self.MoE_args else x
+            x = x @ self.proj
+            return x, router_logits
 
+        expert_tokens = self.ln_post(x[:, 1:self.num_total_cls, :])  # [B, 8, width]
+
+        router_token = self.ln_post(x[:, 0:1, :])  # [B, 1, width]
+        router_logits = self.router_head(router_token)  # [B, 1, 8]
+        topk_logits, topk_indices = torch.topk(router_logits, 1, dim=-1)
+        topk_weights = torch.softmax(topk_logits, dim=-1) # [B, 1, k]
+        
+        batch_idx = torch.arange(x.shape[0], device=x.device).view(-1, 1, 1)
+        selected_experts = expert_tokens[batch_idx, topk_indices] # [B, 1, k, width]
+
+        x = torch.einsum('bik,bikw->biw', topk_weights, selected_experts)  # [B, 1, width]
+        x = x.squeeze(1)  # [B, width]
+        x = self.proj(x)  # [B, output_dim]
+        
+        return x, router_logits
 
 class CLIP(nn.Module):
     def __init__(self,
@@ -360,6 +422,7 @@ class CLIP(nn.Module):
                  load_from_clip: bool,
                  MoE_args=None,
                  num_experts=0,
+                 head_type="",
                  use_short_text=False
                  ):
         super().__init__()
@@ -379,7 +442,8 @@ class CLIP(nn.Module):
             heads=vision_heads,
             output_dim=embed_dim,
             MoE_args=MoE_args,
-            num_experts=num_experts
+            num_experts=num_experts,
+            head_type=head_type
         )
 
         if self.MoE_args:
@@ -481,21 +545,87 @@ class CLIP(nn.Module):
 
     
     def initialize_parameters(self):
+        width = self.visual.conv1.out_channels
+        layers = self.visual.transformer.layers
+        if width == 0: width = 768
+        if layers == 0: layers = 12
+        scale = width ** -0.5
+
+        proj_std = (width ** -0.5) * ((2 * layers) ** -0.5)
+        attn_std = width ** -0.5
+        fc_std = (2 * width) ** -0.5
+
+        # first layers
+        nn.init.normal_(self.visual.conv1.weight, std=0.02)
+        nn.init.normal_(self.visual.cls_tokens, std=scale)
+        nn.init.normal_(self.visual.positional_embedding, std=scale)
+
+        # last layer
+        if isinstance(self.visual.proj, nn.Linear):
+            nn.init.normal_(self.visual.proj.weight, std=scale)
+        elif isinstance(self.visual.proj, nn.Sequential):
+            for m in self.visual.proj:
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, std=scale)
+
+        # vision transformer blocks
+        for block in self.visual.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+            if block.attn.in_proj_bias is not None:
+                nn.init.constant_(block.attn.in_proj_bias, 0.)
+            if block.attn.out_proj.bias is not None:
+                nn.init.constant_(block.attn.out_proj.bias, 0.)
+            if block.mlp.c_fc.bias is not None:
+                nn.init.constant_(block.mlp.c_fc.bias, 0.)
+            if block.mlp.c_proj.bias is not None:
+                nn.init.constant_(block.mlp.c_proj.bias, 0.)
+
+        # text transformer blocks
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+            if block.attn.in_proj_bias is not None:
+                nn.init.constant_(block.attn.in_proj_bias, 0.)
+            if block.attn.out_proj.bias is not None:
+                nn.init.constant_(block.attn.out_proj.bias, 0.)
+            if block.mlp.c_fc.bias is not None:
+                nn.init.constant_(block.mlp.c_fc.bias, 0.)
+            if block.mlp.c_proj.bias is not None:
+                nn.init.constant_(block.mlp.c_proj.bias, 0.)
+
+        # text embeddings
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
+        if hasattr(self, "positional_embedding_res"):
+            nn.init.normal_(self.positional_embedding_res, std=0.01)
 
-        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        attn_std = self.transformer.width ** -0.5
-        fc_std = (2 * self.transformer.width) ** -0.5
-        if not self.MoE_args:
-            for block in self.transformer.resblocks:
-                nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-                nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        # layer norms
+        nn.init.constant_(self.ln_final.weight, 1.0)
+        nn.init.constant_(self.ln_final.bias, 0.0)
+        nn.init.constant_(self.visual.ln_pre.weight, 1.0)
+        nn.init.constant_(self.visual.ln_pre.bias, 0.0)
+        nn.init.constant_(self.visual.ln_post.weight, 1.0)
+        nn.init.constant_(self.visual.ln_post.bias, 0.0)
 
-        if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+        # router head
+        if hasattr(self.visual, 'router_head'):
+            nn.init.normal_(self.visual.router_head.weight, std=0.02)
+        
+        # text projection
+        nn.init.normal_(self.text_projection, std=scale)
+
+        # keep logit scale finite
+        with torch.no_grad():
+            self.logit_scale.fill_(np.log(1 / 0.07))
+            self.logit_scale.clamp_(min=np.log(1/100.0), max=np.log(100.0))
+
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -510,31 +640,20 @@ class CLIP(nn.Module):
         return self.visual.conv1.weight.dtype
 
     def encode_image(self, image, router_output=False):
-        visual_output = self.visual(image.type(self.dtype))
-        router_logits = None
-
-        if self.num_experts > 0:
-            if self.MoE_args:
-                router_token, expert_tokens, router_logits = visual_output
-            else:
-                router_token, expert_tokens = visual_output
-
-            x = router_token.squeeze(1)
+        if self.MoE_args or self.num_experts:
+            x, router_logits = self.visual(image)
         else:
-            if isinstance(visual_output, tuple):
-                x, router_logits = visual_output
-            else:
-                x = visual_output
+            return self.visual(image)
 
-        if self.MoE_args or router_output:
+        if self.training or router_output:
             return x, router_logits
         else:
             return x
 
     def encode_text(self, text,router_output=False): 
-        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
+        x = self.token_embedding(text)  # [batch_size, n_ctx, d_model]
         
-        x = x + (self.positional_embedding.to(x.device) * self.mask1.to(x.device)).type(self.dtype).to(x.device) + (self.positional_embedding_res.to(x.device) * self.mask2.to(x.device)).type(self.dtype).to(x.device) 
+        x = x + (self.positional_embedding.to(x.device) * self.mask1.to(x.device)).to(x.device) + (self.positional_embedding_res.to(x.device) * self.mask2.to(x.device)).to(x.device) 
         router_logits=None
         x = x.permute(1, 0, 2)  # NLD -> LND
         if self.MoE_args:
@@ -542,39 +661,45 @@ class CLIP(nn.Module):
         else:
             x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
+        x = self.ln_final(x)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         if self.MoE_args:
             if self.training or router_output:
-                return x,router_logits
-            else:
-                return x
-        else:
+                return x, router_logits
             return x
+        
+        if self.num_experts:
+            if self.training or router_output:
+                return x, None
+            return x
+        return x
 
 
     def forward(self, image, text_long,text_short,rank):
-        if self.MoE_args:
+        if self.MoE_args or self.num_experts:
             image_features_long,image_routerLogits_long = self.encode_image(image)
             text_features_long,text_routerLogits_long = self.encode_text(text_long)
         else:
             image_features_long = self.encode_image(image)
             text_features_long = self.encode_text(text_long)
             
-        # TODO: Decide which tokens to project for contrastive loss (the 8 expert tokens?)
-        # Currently, image_features_long contains (router_token, expert_tokens)
-        # and will require processing before .norm() can be safely called below.
+        print(f"Image Feats Min/Max: {image_features_long.min()}, {image_features_long.max()}")
+        print(f"Image Feats Norm: {image_features_long.norm(dim=1)}")
 
         # normalized features
-        image_features_long = image_features_long / image_features_long.norm(dim=1, keepdim=True)
-        text_features_long = text_features_long / text_features_long.norm(dim=1, keepdim=True)
+        image_features_long = image_features_long / image_features_long.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        text_features_long = text_features_long / text_features_long.norm(dim=1, keepdim=True).clamp_min(1e-6)
             
-        image_feat_all_long = torch.cat(torch.distributed.nn.all_gather(image_features_long), dim=0)#gather with grad
-        text_feat_all_long = torch.cat(torch.distributed.nn.all_gather(text_features_long), dim=0)
-
+        if torch.distributed.is_initialized():
+            image_feat_all_long = torch.cat(torch.distributed.nn.all_gather(image_features_long), dim=0)
+            text_feat_all_long = torch.cat(torch.distributed.nn.all_gather(text_features_long), dim=0)
+        else:
+            # If testing locally/single-process, the "all" features are just the local features
+            image_feat_all_long = image_features_long
+            text_feat_all_long = text_features_long
         
         sim_i2tl = torch.matmul(image_features_long, text_feat_all_long.T)
         sim_tl2i = torch.matmul(image_feat_all_long, text_features_long.T)
@@ -642,7 +767,7 @@ def convert_weights(model: nn.Module):
         for name in ["text_projection", "proj"]:
             if hasattr(l, name):
                 attr = getattr(l, name)
-                if attr is not None:
+                if attr is not None and isinstance(attr, torch.Tensor):
                     attr.data = attr.data.half()
 
     model.apply(_convert_weights_to_fp16)
@@ -680,7 +805,7 @@ def fix_state_dict_for_multicls(state_dict, num_total_cls):
     return new_sd
 
 
-def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None, multi_cls=False):
+def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None, multi_cls=False, head_type=""):
     num_experts = 8 if multi_cls else 0
     num_total_cls = num_experts + 1
 
@@ -712,7 +837,7 @@ def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None, multi_cls
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, load_from_clip, MoE_args, num_experts
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, load_from_clip, MoE_args, num_experts, head_type=""
     )
 
     if multi_cls:
@@ -722,10 +847,10 @@ def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None, multi_cls
         if key in state_dict:
             del state_dict[key]
     if not MoE_args:
-        convert_weights(model)
+        # convert_weights(model)
         model.load_state_dict(state_dict, strict=False)
         return model.eval()
     else:
         #only build the MoE model, do not load state dict
-        convert_weights(model)
+        # convert_weights(model)
         return model.eval()
