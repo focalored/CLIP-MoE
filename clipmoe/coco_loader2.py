@@ -24,8 +24,8 @@ Target (y): List[dict] (C,)                     -> List of C sets of captioned b
 - Captions (JSON strings) are stored in lists because they have different lengths and can't be stacked in continguous memory
 """
 
-data_path = "D:/ml_research/datasets/coco/val2017"
-ann_path = "D:/ml_research/datasets/coco/annotations/captions_val2017.json"
+data_path = "/project/osprey/scratch/liv/datasets/coco/val2017"
+ann_path = "/project/osprey/scratch/liv/datasets/coco/annotations/captions_val2017.json"
 
 
 class CocoForClipMoE(datasets.CocoDetection):

@@ -300,10 +300,12 @@ class VisionTransformer(nn.Module):
 
         if self.MoE_args:
             self.transformer = MoETransformer(width, layers, heads, MoE_args=MoE_args)
-        else:
+        elif self.num_experts:
             self.transformer = Transformer(width, layers, heads)
             self.router_head = nn.Linear(width, num_experts, bias=False)
             torch.nn.init.normal_(self.router_head.weight, std=0.02)
+        else:
+            self.transformer = Transformer(width, layers, heads)
 
         self.ln_post = LayerNorm(width)
         self.proj = self._get_projection_head(head_type, width, output_dim)
@@ -389,17 +391,26 @@ class VisionTransformer(nn.Module):
             x = x @ self.proj
             return x, router_logits
 
+        if self.num_experts == 0 and not self.MoE_args:
+            x = self.ln_post(x[:, 0, :]) # standard CLS extraction
+            x = self.proj(x)
+            return x
+
         expert_tokens = self.ln_post(x[:, 1:self.num_total_cls, :])  # [B, 8, width]
 
         router_token = self.ln_post(x[:, 0:1, :])  # [B, 1, width]
         router_logits = self.router_head(router_token)  # [B, 1, 8]
-        topk_logits, topk_indices = torch.topk(router_logits, 1, dim=-1)
-        topk_weights = torch.softmax(topk_logits, dim=-1) # [B, 1, k]
-        
+        if self.training:
+            router_logits = router_logits + torch.randn_like(router_logits) * 0.01
+        tau = 1.0
+        all_weights = torch.softmax(router_logits / tau, dim=-1)
+        topk_weights, topk_indices = torch.topk(all_weights, 1, dim=-1)
+
         batch_idx = torch.arange(x.shape[0], device=x.device).view(-1, 1, 1)
         selected_experts = expert_tokens[batch_idx, topk_indices] # [B, 1, k, width]
 
         x = torch.einsum('bik,bikw->biw', topk_weights, selected_experts)  # [B, 1, width]
+        # x = all_weights @ expert_tokens
         x = x.squeeze(1)  # [B, width]
         x = self.proj(x)  # [B, output_dim]
         
@@ -429,7 +440,7 @@ class CLIP(nn.Module):
         self.MoE_args = MoE_args
         self.num_experts = num_experts
 
-        self.context_length = 248
+        self.context_length = context_length
         self.use_short_text=use_short_text
 
     
@@ -467,12 +478,8 @@ class CLIP(nn.Module):
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
 
-        if load_from_clip == False:
-            self.positional_embedding = nn.Parameter(torch.empty(248, transformer_width))
-            self.positional_embedding_res = nn.Parameter(torch.empty(248, transformer_width))
-
-        else:
-            self.positional_embedding = nn.Parameter(torch.empty(77, transformer_width))
+        self.positional_embedding = nn.Parameter(torch.empty(248, transformer_width))
+        self.positional_embedding_res = nn.Parameter(torch.empty(248, transformer_width))
 
         self.ln_final = LayerNorm(transformer_width)
 
@@ -480,9 +487,9 @@ class CLIP(nn.Module):
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         self.initialize_parameters()
-        self.mask1 = torch.zeros([248, 1])
+        self.mask1 = torch.zeros([context_length, 1])
         self.mask1[:20, :] = 1
-        self.mask2 = torch.zeros([248, 1])
+        self.mask2 = torch.zeros([context_length, 1])
         self.mask2[20:, :] = 1
 
     def lock_text_tower(self):
@@ -652,8 +659,14 @@ class CLIP(nn.Module):
 
     def encode_text(self, text,router_output=False): 
         x = self.token_embedding(text)  # [batch_size, n_ctx, d_model]
-        
-        x = x + (self.positional_embedding.to(x.device) * self.mask1.to(x.device)).to(x.device) + (self.positional_embedding_res.to(x.device) * self.mask2.to(x.device)).to(x.device) 
+        seq_len = x.size(1)
+
+        pos_emb = self.positional_embedding[:seq_len, :].to(x.device)
+        pos_emb_res = self.positional_embedding_res[:seq_len, :].to(x.device)
+        m1 = self.mask1[:seq_len, :].to(x.device)
+        m2 = self.mask2[:seq_len, :].to(x.device)
+
+        x = x + (pos_emb * m1) + (pos_emb_res * m2)
         router_logits=None
         x = x.permute(1, 0, 2)  # NLD -> LND
         if self.MoE_args:
@@ -712,8 +725,8 @@ class CLIP(nn.Module):
         targets = torch.linspace(rank * bs,rank * bs + bs - 1, bs, dtype=torch.long).to(image.device)
         
         loss_itcl = (
-                F.cross_entropy(sim_i2tl, targets, label_smoothing=0.1)
-                + F.cross_entropy(sim_tl2i, targets, label_smoothing=0.1)
+                F.cross_entropy(sim_i2tl, targets, label_smoothing=0.0)
+                + F.cross_entropy(sim_tl2i, targets, label_smoothing=0.0)
             ) / 2
         #todo-------
         loss_itcs=0
@@ -743,7 +756,11 @@ class CLIP(nn.Module):
             if self.use_short_text:
                 text_routerLoss_short=load_balancing_loss_func(text_routerLogits_short, top_k=self.MoE_args[1])
                 text_routerLoss_short /= dist.get_world_size()
-            return loss_itcl, loss_itcs,image_routerLoss_long,text_routerLoss_long,text_routerLoss_short
+            return loss_itcl, loss_itcs, image_routerLoss_long, text_routerLoss_long, text_routerLoss_short
+        elif self.num_experts:
+            image_routerLoss_long=load_balancing_loss_func(image_routerLogits_long, top_k=1)
+            image_routerLoss_long /= dist.get_world_size()
+            return loss_itcl, loss_itcs,image_routerLoss_long,
         else:
             return loss_itcl, loss_itcs
         
