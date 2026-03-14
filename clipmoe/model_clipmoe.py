@@ -1,6 +1,6 @@
 from collections import OrderedDict
 from typing import Tuple, Union
-
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -8,6 +8,35 @@ from torch import nn
 import torch.distributed.nn
 import torch.distributed as dist
 from typing import Sequence
+
+
+@dataclass
+class CLIPConfig:
+    embed_dim: int = 768 # embedding dimension
+
+    # vision Transformer
+    vision_width: int = 1024 # Transformer hidden dim
+    vision_layers: int = 12 # number of layers
+    vision_heads: int = 12 # number of heads
+    vision_patch_size: int = 14
+    image_resolution: int = 224
+
+    # Transformer
+    text_width: int = 768
+    text_layers: int = 12
+    text_heads: int = 12
+    vocab_size: int = 49408
+    context_length: int = 248
+
+    # Zhang2025 config
+    num_experts: int = 8
+    top_k: int = 1
+    dropout: int = 0.2
+    MoE_layers: int = 12
+    
+    # multi CLS token specifics
+    num_cls: int = 8
+    head_type: str = "linear"
 
 
 
@@ -135,7 +164,7 @@ class MoEResidualAttentionBlock(nn.Module):
 
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
         routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        #selected_experts batch_size * sequence_length, top_k
+        # selected_experts batch_size * sequence_length, top_k
         routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
         # we cast back to the input dtype
         routing_weights = routing_weights.to(hidden_states.dtype)
@@ -251,24 +280,57 @@ class MoETransformer(nn.Module):
 
 
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int,MoE_args=0):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, MoE_args=0, num_experts=0, head_type=""):
         super().__init__()
-        self.MoE_args=MoE_args
+        self.MoE_args = MoE_args
+        self.num_experts = num_experts
+        self.num_total_cls = num_experts + 1
+
         self.input_resolution = input_resolution
         self.output_dim = output_dim
         self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
 
         scale = width ** -0.5
-        self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        
+        self.cls_tokens = nn.Parameter(scale * torch.randn(self.num_total_cls, width))
+        num_patches = (input_resolution // patch_size) ** 2
+        self.positional_embedding = nn.Parameter(scale * torch.randn(num_patches + self.num_total_cls, width))
+
         self.ln_pre = LayerNorm(width)
-        if MoE_args:
-            self.transformer = MoETransformer(width, layers, heads,MoE_args=MoE_args)
+
+        if self.MoE_args:
+            self.transformer = MoETransformer(width, layers, heads, MoE_args=MoE_args)
+        elif self.num_experts:
+            self.transformer = Transformer(width, layers, heads)
+            self.router_head = nn.Linear(width, num_experts, bias=False)
+            torch.nn.init.normal_(self.router_head.weight, std=0.02)
         else:
             self.transformer = Transformer(width, layers, heads)
 
         self.ln_post = LayerNorm(width)
-        self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
+        self.proj = self._get_projection_head(head_type, width, output_dim)
+
+    def _get_projection_head(self, head_type, width, output_dim, init_std=0.02):
+        """Factory function for modular projection heads in ViT"""
+
+        if head_type == "linear" or head_type == "":
+            head = nn.Linear(width, output_dim, bias=False)
+            torch.nn.init.normal_(head.weight, std=init_std)
+            return head
+        elif head_type == "mlp":
+            head = nn.Sequential(
+                nn.Linear(width, width),
+                QuickGELU(),
+                nn.Linear(width, output_dim)
+            )
+            for module in head:
+                if isinstance(module, nn.Linear):
+                    torch.nn.init.normal_(module.weight, std=init_std)
+                    if module.bias is not None:
+                        torch.nn.init.constant_(module.bias, 0)
+            return head
+        else:
+            raise ValueError(f"Unknown head type: {head_type}")
 
     def lock(self, unlocked_groups=0, freeze_bn_stats=False):
         for param in self.parameters():
@@ -278,7 +340,7 @@ class VisionTransformer(nn.Module):
             groups = [
                 [
                     self.conv1,
-                    self.class_embedding,
+                    self.cls_tokens,
                     self.positional_embedding,
                     self.ln_pre,
                 ],
@@ -304,30 +366,55 @@ class VisionTransformer(nn.Module):
             _unlock(groups[-unlocked_groups:])
 
     def forward(self, x: torch.Tensor):
-        x = self.conv1(x)  # shape = [*, width, grid, grid]
-        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
-        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
-        x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
+        x = self.conv1(x)  # [B, width, H, W]
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # [B, width, num_patches]
+        x = x.permute(0, 2, 1)  # [B, num_patches, width]
+        
+        # Inject tokens + Add new positional embedding
+        cls_tokens = self.cls_tokens.expand(x.shape[0], -1, -1).to(x.dtype)  # [B, 9, width]
+        x = torch.cat([cls_tokens, x], dim=1)  # [B, 9 + num_patches, width]
+        
+        x = x + self.positional_embedding.to(x.dtype)  # [B, 9 + num_patches, width]
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        router_logits=None
+        output = self.transformer(x)
         if self.MoE_args:
-            x,router_logits=self.transformer(x)
+            x, router_logits = output
         else:
-            x = self.transformer(x)
+            x = output
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        x = self.ln_post(x[:, 0, :])
-
-        if self.proj is not None:
-            x = x @ self.proj
+        # Extract tokens
         if self.MoE_args:
-            return x,router_logits
-        else:
+            x = self.ln_post(x[:, 0, :])
+            x = x @ self.proj
+            return x, router_logits
+
+        if self.num_experts == 0 and not self.MoE_args:
+            x = self.ln_post(x[:, 0, :]) # standard CLS extraction
+            x = self.proj(x)
             return x
 
+        expert_tokens = self.ln_post(x[:, 1:self.num_total_cls, :])  # [B, 8, width]
+
+        router_token = self.ln_post(x[:, 0:1, :])  # [B, 1, width]
+        router_logits = self.router_head(router_token)  # [B, 1, 8]
+        if self.training:
+            router_logits = router_logits + torch.randn_like(router_logits) * 0.01
+        tau = 1.0
+        all_weights = torch.softmax(router_logits / tau, dim=-1)
+        topk_weights, topk_indices = torch.topk(all_weights, 1, dim=-1)
+
+        batch_idx = torch.arange(x.shape[0], device=x.device).view(-1, 1, 1)
+        selected_experts = expert_tokens[batch_idx, topk_indices] # [B, 1, k, width]
+
+        x = torch.einsum('bik,bikw->biw', topk_weights, selected_experts)  # [B, 1, width]
+        # x = all_weights @ expert_tokens
+        x = x.squeeze(1)  # [B, width]
+        x = self.proj(x)  # [B, output_dim]
+        
+        return x, router_logits
 
 class CLIP(nn.Module):
     def __init__(self,
@@ -345,12 +432,15 @@ class CLIP(nn.Module):
                  transformer_layers: int, 
                  load_from_clip: bool,
                  MoE_args=None,
+                 num_experts=0,
+                 head_type="",
                  use_short_text=False
                  ):
         super().__init__()
-        self.MoE_args=MoE_args
+        self.MoE_args = MoE_args
+        self.num_experts = num_experts
 
-        self.context_length = 248
+        self.context_length = context_length
         self.use_short_text=use_short_text
 
     
@@ -362,7 +452,9 @@ class CLIP(nn.Module):
             layers=vision_layers,
             heads=vision_heads,
             output_dim=embed_dim,
-            MoE_args=MoE_args
+            MoE_args=MoE_args,
+            num_experts=num_experts,
+            head_type=head_type
         )
 
         if self.MoE_args:
@@ -386,12 +478,8 @@ class CLIP(nn.Module):
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, transformer_width)
 
-        if load_from_clip == False:
-            self.positional_embedding = nn.Parameter(torch.empty(248, transformer_width))
-            self.positional_embedding_res = nn.Parameter(torch.empty(248, transformer_width))
-
-        else:
-            self.positional_embedding = nn.Parameter(torch.empty(77, transformer_width))
+        self.positional_embedding = nn.Parameter(torch.empty(248, transformer_width))
+        self.positional_embedding_res = nn.Parameter(torch.empty(248, transformer_width))
 
         self.ln_final = LayerNorm(transformer_width)
 
@@ -399,9 +487,9 @@ class CLIP(nn.Module):
         self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
 
         self.initialize_parameters()
-        self.mask1 = torch.zeros([248, 1])
+        self.mask1 = torch.zeros([context_length, 1])
         self.mask1[:20, :] = 1
-        self.mask2 = torch.zeros([248, 1])
+        self.mask2 = torch.zeros([context_length, 1])
         self.mask2[20:, :] = 1
 
     def lock_text_tower(self):
@@ -464,21 +552,87 @@ class CLIP(nn.Module):
 
     
     def initialize_parameters(self):
+        width = self.visual.conv1.out_channels
+        layers = self.visual.transformer.layers
+        if width == 0: width = 768
+        if layers == 0: layers = 12
+        scale = width ** -0.5
+
+        proj_std = (width ** -0.5) * ((2 * layers) ** -0.5)
+        attn_std = width ** -0.5
+        fc_std = (2 * width) ** -0.5
+
+        # first layers
+        nn.init.normal_(self.visual.conv1.weight, std=0.02)
+        nn.init.normal_(self.visual.cls_tokens, std=scale)
+        nn.init.normal_(self.visual.positional_embedding, std=scale)
+
+        # last layer
+        if isinstance(self.visual.proj, nn.Linear):
+            nn.init.normal_(self.visual.proj.weight, std=scale)
+        elif isinstance(self.visual.proj, nn.Sequential):
+            for m in self.visual.proj:
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, std=scale)
+
+        # vision transformer blocks
+        for block in self.visual.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+            if block.attn.in_proj_bias is not None:
+                nn.init.constant_(block.attn.in_proj_bias, 0.)
+            if block.attn.out_proj.bias is not None:
+                nn.init.constant_(block.attn.out_proj.bias, 0.)
+            if block.mlp.c_fc.bias is not None:
+                nn.init.constant_(block.mlp.c_fc.bias, 0.)
+            if block.mlp.c_proj.bias is not None:
+                nn.init.constant_(block.mlp.c_proj.bias, 0.)
+
+        # text transformer blocks
+        for block in self.transformer.resblocks:
+            nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
+            nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
+            nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
+            nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+
+            if block.attn.in_proj_bias is not None:
+                nn.init.constant_(block.attn.in_proj_bias, 0.)
+            if block.attn.out_proj.bias is not None:
+                nn.init.constant_(block.attn.out_proj.bias, 0.)
+            if block.mlp.c_fc.bias is not None:
+                nn.init.constant_(block.mlp.c_fc.bias, 0.)
+            if block.mlp.c_proj.bias is not None:
+                nn.init.constant_(block.mlp.c_proj.bias, 0.)
+
+        # text embeddings
         nn.init.normal_(self.token_embedding.weight, std=0.02)
         nn.init.normal_(self.positional_embedding, std=0.01)
+        if hasattr(self, "positional_embedding_res"):
+            nn.init.normal_(self.positional_embedding_res, std=0.01)
 
-        proj_std = (self.transformer.width ** -0.5) * ((2 * self.transformer.layers) ** -0.5)
-        attn_std = self.transformer.width ** -0.5
-        fc_std = (2 * self.transformer.width) ** -0.5
-        if not self.MoE_args:
-            for block in self.transformer.resblocks:
-                nn.init.normal_(block.attn.in_proj_weight, std=attn_std)
-                nn.init.normal_(block.attn.out_proj.weight, std=proj_std)
-                nn.init.normal_(block.mlp.c_fc.weight, std=fc_std)
-                nn.init.normal_(block.mlp.c_proj.weight, std=proj_std)
+        # layer norms
+        nn.init.constant_(self.ln_final.weight, 1.0)
+        nn.init.constant_(self.ln_final.bias, 0.0)
+        nn.init.constant_(self.visual.ln_pre.weight, 1.0)
+        nn.init.constant_(self.visual.ln_pre.bias, 0.0)
+        nn.init.constant_(self.visual.ln_post.weight, 1.0)
+        nn.init.constant_(self.visual.ln_post.bias, 0.0)
 
-        if self.text_projection is not None:
-            nn.init.normal_(self.text_projection, std=self.transformer.width ** -0.5)
+        # router head
+        if hasattr(self.visual, 'router_head'):
+            nn.init.normal_(self.visual.router_head.weight, std=0.02)
+        
+        # text projection
+        nn.init.normal_(self.text_projection, std=scale)
+
+        # keep logit scale finite
+        with torch.no_grad():
+            self.logit_scale.fill_(np.log(1 / 0.07))
+            self.logit_scale.clamp_(min=np.log(1/100.0), max=np.log(100.0))
+
 
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -492,21 +646,27 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image,router_output=False):
-        if self.MoE_args:
-            x,router_logits=self.visual(image.type(self.dtype))
+    def encode_image(self, image, router_output=False):
+        if self.MoE_args or self.num_experts:
+            x, router_logits = self.visual(image)
         else:
-            return self.visual(image.type(self.dtype))
+            return self.visual(image)
 
         if self.training or router_output:
-            return x,router_logits
+            return x, router_logits
         else:
             return x
 
     def encode_text(self, text,router_output=False): 
-        x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
-        
-        x = x + (self.positional_embedding.to(x.device) * self.mask1.to(x.device)).type(self.dtype).to(x.device) + (self.positional_embedding_res.to(x.device) * self.mask2.to(x.device)).type(self.dtype).to(x.device) 
+        x = self.token_embedding(text)  # [batch_size, n_ctx, d_model]
+        seq_len = x.size(1)
+
+        pos_emb = self.positional_embedding[:seq_len, :].to(x.device)
+        pos_emb_res = self.positional_embedding_res[:seq_len, :].to(x.device)
+        m1 = self.mask1[:seq_len, :].to(x.device)
+        m2 = self.mask2[:seq_len, :].to(x.device)
+
+        x = x + (pos_emb * m1) + (pos_emb_res * m2)
         router_logits=None
         x = x.permute(1, 0, 2)  # NLD -> LND
         if self.MoE_args:
@@ -514,36 +674,45 @@ class CLIP(nn.Module):
         else:
             x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
+        x = self.ln_final(x)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
         x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
         if self.MoE_args:
             if self.training or router_output:
-                return x,router_logits
-            else:
-                return x
-        else:
+                return x, router_logits
             return x
+        
+        if self.num_experts:
+            if self.training or router_output:
+                return x, None
+            return x
+        return x
 
 
     def forward(self, image, text_long,text_short,rank):
-        if self.MoE_args:
+        if self.MoE_args or self.num_experts:
             image_features_long,image_routerLogits_long = self.encode_image(image)
             text_features_long,text_routerLogits_long = self.encode_text(text_long)
         else:
             image_features_long = self.encode_image(image)
             text_features_long = self.encode_text(text_long)
             
+        print(f"Image Feats Min/Max: {image_features_long.min()}, {image_features_long.max()}")
+        print(f"Image Feats Norm: {image_features_long.norm(dim=1)}")
 
         # normalized features
-        image_features_long = image_features_long / image_features_long.norm(dim=1, keepdim=True)
-        text_features_long = text_features_long / text_features_long.norm(dim=1, keepdim=True)
+        image_features_long = image_features_long / image_features_long.norm(dim=1, keepdim=True).clamp_min(1e-6)
+        text_features_long = text_features_long / text_features_long.norm(dim=1, keepdim=True).clamp_min(1e-6)
             
-        image_feat_all_long = torch.cat(torch.distributed.nn.all_gather(image_features_long), dim=0)#gather with grad
-        text_feat_all_long = torch.cat(torch.distributed.nn.all_gather(text_features_long), dim=0)
-
+        if torch.distributed.is_initialized():
+            image_feat_all_long = torch.cat(torch.distributed.nn.all_gather(image_features_long), dim=0)
+            text_feat_all_long = torch.cat(torch.distributed.nn.all_gather(text_features_long), dim=0)
+        else:
+            # If testing locally/single-process, the "all" features are just the local features
+            image_feat_all_long = image_features_long
+            text_feat_all_long = text_features_long
         
         sim_i2tl = torch.matmul(image_features_long, text_feat_all_long.T)
         sim_tl2i = torch.matmul(image_feat_all_long, text_features_long.T)
@@ -556,8 +725,8 @@ class CLIP(nn.Module):
         targets = torch.linspace(rank * bs,rank * bs + bs - 1, bs, dtype=torch.long).to(image.device)
         
         loss_itcl = (
-                F.cross_entropy(sim_i2tl, targets, label_smoothing=0.1)
-                + F.cross_entropy(sim_tl2i, targets, label_smoothing=0.1)
+                F.cross_entropy(sim_i2tl, targets, label_smoothing=0.0)
+                + F.cross_entropy(sim_tl2i, targets, label_smoothing=0.0)
             ) / 2
         #todo-------
         loss_itcs=0
@@ -587,7 +756,11 @@ class CLIP(nn.Module):
             if self.use_short_text:
                 text_routerLoss_short=load_balancing_loss_func(text_routerLogits_short, top_k=self.MoE_args[1])
                 text_routerLoss_short /= dist.get_world_size()
-            return loss_itcl, loss_itcs,image_routerLoss_long,text_routerLoss_long,text_routerLoss_short
+            return loss_itcl, loss_itcs, image_routerLoss_long, text_routerLoss_long, text_routerLoss_short
+        elif self.num_experts:
+            image_routerLoss_long=load_balancing_loss_func(image_routerLogits_long, top_k=1)
+            image_routerLoss_long /= dist.get_world_size()
+            return loss_itcl, loss_itcs,image_routerLoss_long,
         else:
             return loss_itcl, loss_itcs
         
@@ -611,13 +784,48 @@ def convert_weights(model: nn.Module):
         for name in ["text_projection", "proj"]:
             if hasattr(l, name):
                 attr = getattr(l, name)
-                if attr is not None:
+                if attr is not None and isinstance(attr, torch.Tensor):
                     attr.data = attr.data.half()
 
     model.apply(_convert_weights_to_fp16)
 
 
-def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None):
+def fix_state_dict_for_multicls(state_dict, num_total_cls):
+    """
+    Expands positional embeddings and renames/reshapes class_embedding 
+    to fit the new cls_tokens parameter.
+    """
+    new_sd = state_dict.copy()
+    
+    # 1. Handle Positional Embedding [257, 1024] -> [265, 1024]
+    if "visual.positional_embedding" in state_dict:
+        v = state_dict["visual.positional_embedding"]
+        old_cls_pe = v[0:1]
+        patches_pe = v[1:]
+        width = v.shape[-1]
+        
+        expanded_pe = torch.zeros((num_total_cls + patches_pe.shape[0], width), dtype=v.dtype)
+        expanded_pe[0:1].copy_(old_cls_pe) # Original CLS PE stays at the front (router)
+        expanded_pe[num_total_cls:].copy_(patches_pe) # Patches move to the back
+        new_sd["visual.positional_embedding"] = expanded_pe
+
+    # 2. Convert class_embedding (vector) to cls_tokens (matrix)
+    if "visual.class_embedding" in state_dict:
+        v = state_dict["visual.class_embedding"] # [width]
+        width = v.shape[-1]
+        # Create [9, width] and place original CLS at index 0
+        new_cls = torch.zeros((num_total_cls, width), dtype=v.dtype)
+        new_cls[0].copy_(v)
+        new_sd["visual.cls_tokens"] = new_cls
+        del new_sd["visual.class_embedding"]
+
+    return new_sd
+
+
+def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None, multi_cls=False, head_type=""):
+    num_experts = 8 if multi_cls else 0
+    num_total_cls = num_experts + 1
+
     #MoE_args: None for standard non-MoE model. [num_MoE_experts,top_k]
     vit = "visual.proj" in state_dict
 
@@ -646,17 +854,20 @@ def build_model(state_dict: dict, load_from_clip: bool, MoE_args=None):
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
-        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, load_from_clip,MoE_args
+        context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, load_from_clip, MoE_args, num_experts, head_type=""
     )
+
+    if multi_cls:
+        state_dict = fix_state_dict_for_multicls(state_dict, num_total_cls)
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
         if key in state_dict:
             del state_dict[key]
     if not MoE_args:
-        convert_weights(model)
-        model.load_state_dict(state_dict)
+        # convert_weights(model)
+        model.load_state_dict(state_dict, strict=False)
         return model.eval()
     else:
         #only build the MoE model, do not load state dict
-        convert_weights(model)
+        # convert_weights(model)
         return model.eval()
