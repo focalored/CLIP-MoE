@@ -1,0 +1,35 @@
+# @package _global_
+#
+# python src/train.py experiment=train_multi_index
+
+defaults:
+  - override /model: multi_index
+  - override /data: image_text
+  - override /trainer: gpu
+  - override /callbacks: default
+  - override /logger: wandb
+
+tags: ["multi-index", "clip"]
+seed: 42
+
+trainer:
+  max_epochs: 50
+  precision: "bf16-mixed"
+  gradient_clip_val: 1.0
+
+model:
+  model_name: "openai/clip-vit-large-patch14"
+  num_db_indices: 8
+  db_dim: 256
+  hidden_dim: 512
+  num_attn_layers: 4
+  num_cls_tokens: 4
+  cls_mode: "append"
+  router_temperature: 0.5
+  lr: 3e-4
+  warmup_steps: 1000
+  t_max: ${trainer.max_epochs}
+
+data:
+  batch_size: 128
+  num_workers: 8

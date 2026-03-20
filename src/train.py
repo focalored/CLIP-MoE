@@ -3,12 +3,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import hydra
 import lightning as L
 import rootutils
-import torch
 from lightning import Callback, LightningDataModule, LightningModule, Trainer
 from lightning.pytorch.loggers import Logger
 from omegaconf import DictConfig
-
-torch.autograd.set_detect_anomaly(True)
 
 rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 # ------------------------------------------------------------------------------------ #
@@ -84,13 +81,6 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         log.info("Logging hyperparameters!")
         log_hyperparameters(object_dict)
 
-    # Run initial validation before training if both train and test are enabled
-    if cfg.get("train") and cfg.get("test"):
-        log.info("Running initial validation before training!")
-        trainer.test(model=model, datamodule=datamodule, ckpt_path=None)
-        initial_metrics = trainer.callback_metrics.copy()
-        log.info(f"Initial validation metrics: {initial_metrics}")
-
     if cfg.get("train"):
         log.info("Starting training!")
         trainer.fit(model=model, datamodule=datamodule, ckpt_path=cfg.get("ckpt_path"))
@@ -98,13 +88,11 @@ def train(cfg: DictConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     train_metrics = trainer.callback_metrics
 
     if cfg.get("test"):
-        log.info("Starting final testing!")
-        # ckpt_path = trainer.checkpoint_callback.best_model_path
-        # if ckpt_path == "":
-        #     log.warning("Best ckpt not found! Using current weights for testing...")
-        #     ckpt_path = None
-        # TODO: do this properly
-        ckpt_path = None
+        log.info("Starting testing!")
+        ckpt_path = trainer.checkpoint_callback.best_model_path
+        if ckpt_path == "":
+            log.warning("Best ckpt not found! Using current weights for testing...")
+            ckpt_path = None
         trainer.test(model=model, datamodule=datamodule, ckpt_path=ckpt_path)
         log.info(f"Best ckpt path: {ckpt_path}")
 
