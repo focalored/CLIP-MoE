@@ -1,7 +1,7 @@
 # https://wandb.ai
 wandb:
   _target_: lightning.pytorch.loggers.wandb.WandbLogger
-  project: "mixedres"
+  project: "multi-index-retrieval"
   tags: ${task_name}
   group: ""
   log_model: False

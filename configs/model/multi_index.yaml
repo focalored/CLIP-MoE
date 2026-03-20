@@ -1,0 +1,30 @@
+_target_: src.models.retrieval_module.MultiIndexRetrievalModule
+
+model_name: "openai/clip-vit-large-patch14"   # "google/siglip2-so400m-patch14-384", etc.
+freeze_vision: true       # freeze backbone vision encoder weights
+freeze_text: true         # freeze backbone text encoder weights
+
+# Retriever architecture
+num_db_indices: 128         # N — number of parallel database embedding spaces
+db_dim: 32               # output dim per database index
+hidden_dim: 512           # internal dim of the projection self-attention heads
+num_heads: 8              # attention heads in the projection layers
+num_attn_layers: 4        # depth of the projection self-attention heads
+num_cls_tokens: 1         # number of CLS tokens fed into the projection heads
+cls_mode: "append"        # "append" = independent learnable tokens + backbone CLS
+                          # "project" = project backbone CLS into num_cls_tokens vectors
+mlp_ratio: 4.0            # FFN expansion ratio in each self-attention block
+dropout: 0.0              # dropout in attention and FFN layers
+
+# Loss
+router_temperature: 1.0   # softmax temperature for the per-query router distribution
+label_smoothing: 0.0      # cross-entropy label smoothing
+gather_distributed: false  # all-gather embeddings across GPUs for contrastive loss
+
+# Optimizer (AdamW)
+lr: 1e-4
+weight_decay: 0.01
+warmup_steps: 500         # linear warmup steps
+
+# Scheduler (linear warmup then cosine annealing with warm restarts)
+t_max: 50                 # cosine period (epochs or steps depending on trainer)

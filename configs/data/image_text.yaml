@@ -1,0 +1,23 @@
+_target_: src.data.image_text_module.ImageTextDataModule
+
+# Processor — inherits from backbone model so tokenization/image-preprocessing matches
+model_name: ${model.model_name}
+
+# Dataset — any HuggingFace dataset with an image column and a text/caption column
+dataset_name: "nlphuji/flickr30k"
+dataset_config: null      # HF dataset config name, e.g. "en" (null if none)
+image_column: "image"     # column name containing PIL images
+caption_column: "caption" # column name containing text strings (or lists of strings)
+
+# Splits
+train_split: "test"       # flickr30k only has "test"; override per dataset
+val_split: "test"
+test_split: "test"
+
+# Tokenizer
+max_length: 77            # max token length for text inputs
+
+# DataLoader
+batch_size: 64
+num_workers: 4
+pin_memory: true
